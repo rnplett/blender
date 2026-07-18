@@ -37,9 +37,13 @@ MOUNTING_HOLE_SEGMENTS = 48
 
 # Prebuilt lower-right branding, designed for a 0.06-inch CNC bit.
 BRAND_SVG_FILENAME = "aspenhollow-logo.svg"
-BRAND_MAX_WIDTH = 3.1
-BRAND_MAX_HEIGHT = 0.58
+BRAND_MAX_WIDTH = 3.8
+BRAND_MAX_HEIGHT = 0.75
 BRAND_BORDER_GAP = 0.12
+BRAND_TOOL_DIAMETER = 0.0625
+BRAND_TOOL_SAFETY_FACTOR = 1.05
+# Measured from the baked SVG: narrowest wordmark stroke / total logo height.
+BRAND_MIN_FEATURE_RATIO = 0.0512 / 0.58
 
 
 def find_font():
@@ -313,6 +317,16 @@ def make_brand_cutters():
     scale = min(BRAND_MAX_WIDTH / source_width, BRAND_MAX_HEIGHT / source_height)
     fitted_width = source_width * scale
     fitted_height = source_height * scale
+    fitted_min_feature = fitted_height * BRAND_MIN_FEATURE_RATIO
+    required_feature = BRAND_TOOL_DIAMETER * BRAND_TOOL_SAFETY_FACTOR
+    if fitted_min_feature < required_feature:
+        required_height = required_feature / BRAND_MIN_FEATURE_RATIO
+        required_width = required_height * source_width / source_height
+        raise ValueError(
+            f'The brand logo is too small for the {BRAND_TOOL_DIAMETER}" bit. '
+            f'Increase BRAND_MAX_WIDTH to at least {required_width:.3f}" and '
+            f'BRAND_MAX_HEIGHT to at least {required_height:.3f}".'
+        )
     bottom_border_y = -SIGN_HEIGHT / 2 + MOUNTING_HOLE_EDGE_OFFSET
     brand_bottom = bottom_border_y + BORDER_WIDTH / 2 + BRAND_BORDER_GAP
     right_border_x = SIGN_WIDTH / 2 - BORDER_INSET
@@ -335,7 +349,8 @@ def make_brand_cutters():
 
     print(
         f'Brand SVG: {fitted_width:.2f}" wide x {fitted_height:.2f}" high; '
-        f'{len(cutters)} reusable path(s) from {filepath}'
+        f'minimum feature {fitted_min_feature:.4f}" for '
+        f'{BRAND_TOOL_DIAMETER}" bit; {len(cutters)} reusable path(s) from {filepath}'
     )
     return cutters
 
@@ -380,6 +395,8 @@ def main():
         raise ValueError("Brand dimensions must be greater than zero")
     if BRAND_BORDER_GAP < 0:
         raise ValueError("BRAND_BORDER_GAP cannot be negative")
+    if min(BRAND_TOOL_DIAMETER, BRAND_TOOL_SAFETY_FACTOR, BRAND_MIN_FEATURE_RATIO) <= 0:
+        raise ValueError("Brand tool-check values must be greater than zero")
 
     # This script builds a new scene, so remove all existing objects.
     bpy.ops.object.select_all(action="SELECT")

@@ -14,7 +14,13 @@ SLICE_DEPTH_MM = 1.0
 # The SVG is saved beside the current .blend file as
 # "<Blender filename>-cross-section.svg".
 MARGIN_MM = 2.0
-STROKE_WIDTH_MM = 0.2
+
+# Operation classification. These match make-sign.py's generated layout.
+MOUNTING_HOLE_DIAMETER_IN = 0.25
+MOUNTING_HOLE_EDGE_OFFSET_IN = 0.5
+MOUNTING_HOLE_MATCH_TOLERANCE = 0.20
+LOGO_REGION_WIDTH_IN = 4.25
+LOGO_REGION_HEIGHT_IN = 1.75
 
 
 # ------------------------------------------------------------
@@ -91,6 +97,115 @@ def delete_existing_object(name):
         bpy.data.objects.remove(existing, do_unlink=True)
 
 
+def polygon_area(points):
+    """Return the signed area of a closed two-dimensional polygon."""
+    return sum(
+        x1 * y2 - x2 * y1
+        for (x1, y1), (x2, y2) in zip(points, points[1:] + points[:1])
+    ) / 2.0
+
+
+def point_in_polygon(point, polygon):
+    """Return whether a point lies inside a polygon using ray casting."""
+    px, py = point
+    inside = False
+    previous = polygon[-1]
+    for current in polygon:
+        x1, y1 = current
+        x2, y2 = previous
+        if (y1 > py) != (y2 > py):
+            crossing_x = (x2 - x1) * (py - y1) / (y2 - y1) + x1
+            if px < crossing_x:
+                inside = not inside
+        previous = current
+    return inside
+
+
+def compound_carved_shapes(paths):
+    """Group nested closed loops into filled carved regions and their islands."""
+    closed = [path for path in paths if path["closed"] and len(path["points"]) >= 3]
+    areas = [abs(polygon_area(path["points"])) for path in closed]
+    parents = [None] * len(closed)
+
+    for index, path in enumerate(closed):
+        containing = [
+            candidate
+            for candidate, other in enumerate(closed)
+            if areas[candidate] > areas[index]
+            and point_in_polygon(path["points"][0], other["points"])
+        ]
+        if containing:
+            parents[index] = min(containing, key=lambda candidate: areas[candidate])
+
+    depths = []
+    for index in range(len(closed)):
+        depth = 0
+        parent = parents[index]
+        while parent is not None:
+            depth += 1
+            parent = parents[parent]
+        depths.append(depth)
+
+    # Depth zero is the sign's outside perimeter. Odd depths are voids cut
+    # from the material; their direct even-depth children are uncut islands,
+    # such as the inside of a border or a letter counter.
+    shapes = []
+    for index, depth in enumerate(depths):
+        if depth % 2 == 1:
+            children = [
+                child
+                for child, parent in enumerate(parents)
+                if parent == index
+            ]
+            shapes.append([closed[index]] + [closed[child] for child in children])
+    return shapes
+
+
+def shape_bounds(shape):
+    """Return XY bounds for every contour in a compound carved shape."""
+    points = [point for contour in shape for point in contour["points"]]
+    xs = [point[0] for point in points]
+    ys = [point[1] for point in points]
+    return min(xs), max(xs), min(ys), max(ys)
+
+
+def classify_carved_shape(shape, sign_bounds):
+    """Return logo, holes, or main for a carved compound shape."""
+    min_x, max_x, min_y, max_y = shape_bounds(shape)
+    sign_min_x, sign_max_x, sign_min_y, sign_max_y = sign_bounds
+    width = max_x - min_x
+    height = max_y - min_y
+    center_x = (min_x + max_x) / 2
+    center_y = (min_y + max_y) / 2
+
+    diameter_mm = MOUNTING_HOLE_DIAMETER_IN * 25.4
+    edge_offset_mm = MOUNTING_HOLE_EDGE_OFFSET_IN * 25.4
+    diameter_tolerance = diameter_mm * MOUNTING_HOLE_MATCH_TOLERANCE
+    position_tolerance = max(diameter_tolerance, 0.5)
+    sign_center_x = (sign_min_x + sign_max_x) / 2
+    expected_hole_ys = (
+        sign_min_y + edge_offset_mm,
+        sign_max_y - edge_offset_mm,
+    )
+    is_mounting_hole = (
+        abs(width - diameter_mm) <= diameter_tolerance
+        and abs(height - diameter_mm) <= diameter_tolerance
+        and abs(center_x - sign_center_x) <= position_tolerance
+        and any(
+            abs(center_y - expected_y) <= position_tolerance
+            for expected_y in expected_hole_ys
+        )
+    )
+    if is_mounting_hole:
+        return "holes"
+
+    logo_left = sign_max_x - LOGO_REGION_WIDTH_IN * 25.4
+    logo_top = sign_min_y + LOGO_REGION_HEIGHT_IN * 25.4
+    if min_x >= logo_left and max_y <= logo_top:
+        return "logo"
+    return "main"
+
+
 def save_cross_section_svg(obj):
     """Save a Curve object as an SVG beside the current .blend file."""
     if not bpy.data.filepath:
@@ -136,8 +251,7 @@ def save_cross_section_svg(obj):
     svg_width = drawing_width + 2.0 * MARGIN_MM
     svg_height = drawing_height + 2.0 * MARGIN_MM
 
-    elements = []
-    for path in paths:
+    def svg_path_commands(path):
         converted = [
             (x - min_x + MARGIN_MM, max_y - y + MARGIN_MM)
             for x, y in path["points"]
@@ -147,33 +261,82 @@ def save_cross_section_svg(obj):
         commands.extend(f"L {x:.6f},{y:.6f}" for x, y in converted[1:])
         if path["closed"]:
             commands.append("Z")
-        elements.append(f'  <path d="{escape(" ".join(commands))}" />')
+        return " ".join(commands)
 
-    svg_contents = f"""<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+    carved_shapes = compound_carved_shapes(paths)
+    if not carved_shapes:
+        raise RuntimeError(
+            "No enclosed carved regions were found in the cross section. "
+            "Verify that the slice depth passes through the carved pockets."
+        )
+
+    classified_elements = {"logo": [], "holes": [], "main": []}
+    sign_bounds = (min_x, max_x, min_y, max_y)
+    for index, shape in enumerate(carved_shapes, start=1):
+        oriented_shape = []
+        for contour_index, path in enumerate(shape):
+            # Easel's SVG conversion is more reliable when holes use opposite
+            # winding rather than depending on even-odd fill support. The SVG
+            # Y-axis inversion below reverses both windings but preserves their
+            # required opposition.
+            want_counter_clockwise = contour_index == 0
+            points = path["points"]
+            is_counter_clockwise = polygon_area(points) > 0
+            if is_counter_clockwise != want_counter_clockwise:
+                points = list(reversed(points))
+            oriented_shape.append({"points": points, "closed": True})
+
+        compound_path = " ".join(
+            svg_path_commands(path) for path in oriented_shape
+        )
+        operation = classify_carved_shape(shape, sign_bounds)
+        element = (
+            f'  <path id="carved-region-{index}" '
+            f'data-operation="{operation}" '
+            f'd="{escape(compound_path)}" fill="#000000" stroke="none" '
+            f'fill-rule="nonzero" />'
+        )
+        classified_elements[operation].append(element)
+
+    def svg_document(body, source):
+        return f"""<?xml version="1.0" encoding="UTF-8" standalone="no"?>
 <svg
     xmlns="http://www.w3.org/2000/svg"
     width="{svg_width:.6f}mm"
     height="{svg_height:.6f}mm"
-    viewBox="0 0 {svg_width:.6f} {svg_height:.6f}">
-  <g
-      id="{escape(obj.name)}"
-      fill="none"
-      stroke="#000000"
-      stroke-width="{STROKE_WIDTH_MM:.6f}"
-      vector-effect="non-scaling-stroke">
-{os.linesep.join(elements)}
-  </g>
+    viewBox="0 0 {svg_width:.6f} {svg_height:.6f}"
+    data-source="{escape(source)}">
+{body}
 </svg>
 """
 
     blend_name = os.path.splitext(os.path.basename(bpy.data.filepath))[0]
-    svg_filename = f"{blend_name}-cross-section.svg"
-    filepath = bpy.path.abspath("//" + svg_filename)
-    with open(filepath, "w", encoding="utf-8") as svg_file:
-        svg_file.write(svg_contents)
+    for operation, elements in classified_elements.items():
+        if not elements:
+            raise RuntimeError(
+                f"No {operation} pockets were detected. Check the operation "
+                "classification settings at the top of this script."
+            )
 
-    print(f"SVG exported successfully: {filepath}")
+    # Keep every pocket as a direct child of the SVG. Easel then exposes each
+    # path independently while preserving compound contours within a pocket.
+    ordered_elements = (
+        classified_elements["main"]
+        + classified_elements["logo"]
+        + classified_elements["holes"]
+    )
+    filename = f"{blend_name}-carving-pockets.svg"
+    filepath = bpy.path.abspath("//" + filename)
+    contents = svg_document(os.linesep.join(ordered_elements), obj.name)
+    with open(filepath, "w", encoding="utf-8") as svg_file:
+        svg_file.write(contents)
+
+    print(f"Combined carving SVG: {filepath}")
+    for operation in ("main", "logo", "holes"):
+        print(f"  {operation.title()}: {len(classified_elements[operation])} pocket(s)")
+
     print(f"Geometry size: {drawing_width:.3f} mm x {drawing_height:.3f} mm")
+    print(f"Carved regions: {len(carved_shapes)} filled compound shape(s)")
     return filepath
 
 
