@@ -35,6 +35,12 @@ MOUNTING_HOLE_EDGE_OFFSET = 0.5
 MOUNTING_HOLE_BORDER_CLEARANCE = 0.08
 MOUNTING_HOLE_SEGMENTS = 48
 
+# Prebuilt lower-right branding, designed for a 0.06-inch CNC bit.
+BRAND_SVG_FILENAME = "aspenhollow-logo.svg"
+BRAND_MAX_WIDTH = 3.1
+BRAND_MAX_HEIGHT = 0.58
+BRAND_BORDER_GAP = 0.12
+
 
 def find_font():
     """Load the first available sans-serif font, or use Blender's default."""
@@ -79,6 +85,13 @@ def mesh_bounds(obj):
         (max(ys) + min(ys)) / 2,
         max(zs),
     )
+
+
+def mesh_xy_bounds(obj):
+    """Return the minimum and maximum local XY coordinates of a mesh."""
+    xs = [vertex.co.x for vertex in obj.data.vertices]
+    ys = [vertex.co.y for vertex in obj.data.vertices]
+    return min(xs), max(xs), min(ys), max(ys)
 
 
 def delete_object(obj):
@@ -234,6 +247,99 @@ def make_mounting_hole_cutters():
     return cutters
 
 
+def find_brand_svg():
+    """Find the reusable logo beside the project script or an ancestor of the blend."""
+    candidates = [os.path.join(os.getcwd(), BRAND_SVG_FILENAME)]
+    if "__file__" in globals():
+        candidates.append(os.path.join(os.path.dirname(__file__), BRAND_SVG_FILENAME))
+
+    directory = os.path.dirname(bpy.data.filepath)
+    for _ in range(5):
+        candidates.append(os.path.join(directory, BRAND_SVG_FILENAME))
+        parent = os.path.dirname(directory)
+        if parent == directory:
+            break
+        directory = parent
+
+    for candidate in candidates:
+        candidate = os.path.abspath(candidate)
+        if os.path.isfile(candidate):
+            return candidate
+    raise FileNotFoundError(
+        f"Could not find {BRAND_SVG_FILENAME!r} beside the script or blend project"
+    )
+
+
+def make_brand_cutters():
+    """Import, size, and place the prebuilt lower-right logo SVG."""
+    filepath = find_brand_svg()
+    before = set(bpy.data.objects)
+    try:
+        bpy.ops.import_curve.svg(filepath=filepath)
+    except AttributeError:
+        bpy.ops.wm.svg_import(filepath=filepath)
+
+    curves = [
+        obj for obj in bpy.data.objects
+        if obj not in before and obj.type == "CURVE"
+    ]
+    if not curves:
+        raise RuntimeError(f"No filled paths were imported from {filepath}")
+
+    cutter_height = CUT_DEPTH + Z_OVERSHOOT
+    cutters = []
+    for index, curve in enumerate(curves):
+        bpy.ops.object.select_all(action="DESELECT")
+        curve.select_set(True)
+        bpy.context.view_layer.objects.active = curve
+        curve.data.dimensions = "2D"
+        curve.data.fill_mode = "BOTH"
+        curve.data.extrude = cutter_height
+        bpy.ops.object.convert(target="MESH")
+        bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+        curve.name = f"cutter_brand_svg_{index}"
+        cutters.append(curve)
+
+    all_vertices = [vertex.co for cutter in cutters for vertex in cutter.data.vertices]
+    min_x = min(vertex.x for vertex in all_vertices)
+    max_x = max(vertex.x for vertex in all_vertices)
+    min_y = min(vertex.y for vertex in all_vertices)
+    max_y = max(vertex.y for vertex in all_vertices)
+    source_width = max_x - min_x
+    source_height = max_y - min_y
+    if source_width <= 0 or source_height <= 0:
+        raise RuntimeError("The brand SVG has zero width or height")
+
+    scale = min(BRAND_MAX_WIDTH / source_width, BRAND_MAX_HEIGHT / source_height)
+    fitted_width = source_width * scale
+    fitted_height = source_height * scale
+    bottom_border_y = -SIGN_HEIGHT / 2 + MOUNTING_HOLE_EDGE_OFFSET
+    brand_bottom = bottom_border_y + BORDER_WIDTH / 2 + BRAND_BORDER_GAP
+    right_border_x = SIGN_WIDTH / 2 - BORDER_INSET
+    brand_right = right_border_x - BORDER_WIDTH / 2 - BRAND_BORDER_GAP
+    brand_left = brand_right - fitted_width
+    top_z = SIGN_DEPTH / 2 + Z_OVERSHOOT
+    bottom_z = top_z - cutter_height
+
+    for cutter in cutters:
+        source_zs = [vertex.co.z for vertex in cutter.data.vertices]
+        min_z = min(source_zs)
+        source_depth = max(source_zs) - min_z
+        if source_depth <= 0:
+            raise RuntimeError("Could not extrude a brand SVG path")
+        for vertex in cutter.data.vertices:
+            normalized_z = (vertex.co.z - min_z) / source_depth
+            vertex.co.x = brand_left + (vertex.co.x - min_x) * scale
+            vertex.co.y = brand_bottom + (vertex.co.y - min_y) * scale
+            vertex.co.z = bottom_z + normalized_z * cutter_height
+
+    print(
+        f'Brand SVG: {fitted_width:.2f}" wide x {fitted_height:.2f}" high; '
+        f'{len(cutters)} reusable path(s) from {filepath}'
+    )
+    return cutters
+
+
 def subtract_cutter(sign, cutter):
     """Boolean-subtract one cutter from the sign."""
     bpy.context.view_layer.objects.active = sign
@@ -248,6 +354,16 @@ def subtract_cutter(sign, cutter):
     bpy.ops.object.modifier_apply(modifier=modifier.name)
 
 
+def place_sign_at_origin(sign):
+    """Place the sign in positive XY with its top at Z=0 and body below it."""
+    min_x, _, min_y, _ = mesh_xy_bounds(sign)
+    max_z = max(vertex.co.z for vertex in sign.data.vertices)
+    sign.location = (-min_x, -min_y, -max_z)
+    bpy.context.view_layer.objects.active = sign
+    sign.select_set(True)
+    bpy.ops.object.transform_apply(location=True, rotation=False, scale=False)
+
+
 def main():
     lines = [line.strip() for line in SIGN_TEXT.splitlines() if line.strip()]
     if not lines:
@@ -260,6 +376,10 @@ def main():
         raise ValueError("MOUNTING_HOLE_BORDER_CLEARANCE cannot be negative")
     if MOUNTING_HOLE_SEGMENTS < 8:
         raise ValueError("MOUNTING_HOLE_SEGMENTS must be at least 8")
+    if min(BRAND_MAX_WIDTH, BRAND_MAX_HEIGHT) <= 0:
+        raise ValueError("Brand dimensions must be greater than zero")
+    if BRAND_BORDER_GAP < 0:
+        raise ValueError("BRAND_BORDER_GAP cannot be negative")
 
     # This script builds a new scene, so remove all existing objects.
     bpy.ops.object.select_all(action="SELECT")
@@ -274,7 +394,8 @@ def main():
 
     bpy.ops.mesh.primitive_cube_add(size=1, location=(0, 0, 0))
     sign = bpy.context.active_object
-    sign.name = "Carved_Text_Sign"
+    blend_name = os.path.splitext(os.path.basename(bpy.data.filepath))[0]
+    sign.name = f"{blend_name or 'untitled'}-sign"
     sign.scale = (SIGN_WIDTH, SIGN_HEIGHT, SIGN_DEPTH)
     bpy.ops.object.transform_apply(scale=True)
 
@@ -316,6 +437,7 @@ def main():
 
     cutters.extend(make_border_cutters())
     cutters.extend(make_mounting_hole_cutters())
+    cutters.extend(make_brand_cutters())
 
     for cutter in cutters:
         subtract_cutter(sign, cutter)
@@ -326,6 +448,7 @@ def main():
     bpy.ops.object.select_all(action="DESELECT")
     sign.select_set(True)
     bpy.context.view_layer.objects.active = sign
+    place_sign_at_origin(sign)
 
     print(
         f'Done: {SIGN_WIDTH}" x {SIGN_HEIGHT}" sign with text {SIGN_TEXT!r}; '

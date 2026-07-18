@@ -10,10 +10,9 @@ from xml.sax.saxutils import escape
 # ------------------------------------------------------------
 
 SLICE_DEPTH_MM = 1.0
-CROSS_SECTION_NAME = "Cross_Section_1mm"
 
-# The SVG is saved beside the current .blend file.
-SVG_FILENAME = "sign_cross_section.svg"
+# The SVG is saved beside the current .blend file as
+# "<Blender filename>-cross-section.svg".
 MARGIN_MM = 2.0
 STROKE_WIDTH_MM = 0.2
 
@@ -167,7 +166,9 @@ def save_cross_section_svg(obj):
 </svg>
 """
 
-    filepath = bpy.path.abspath("//" + SVG_FILENAME)
+    blend_name = os.path.splitext(os.path.basename(bpy.data.filepath))[0]
+    svg_filename = f"{blend_name}-cross-section.svg"
+    filepath = bpy.path.abspath("//" + svg_filename)
     with open(filepath, "w", encoding="utf-8") as svg_file:
         svg_file.write(svg_contents)
 
@@ -184,6 +185,9 @@ obj = bpy.context.active_object
 
 if obj is None:
     raise RuntimeError("Select the sign object first.")
+
+blend_name = os.path.splitext(os.path.basename(bpy.data.filepath))[0]
+cross_section_name = f"{blend_name or 'untitled'}-cross-section"
 
 if obj.type not in {"MESH", "CURVE", "FONT", "SURFACE", "META"}:
     raise RuntimeError(
@@ -270,11 +274,11 @@ try:
     chains = trace_edge_chains(coordinates, indexed_edges)
 
     # Remove the previous generated cross section, if present.
-    delete_existing_object(CROSS_SECTION_NAME)
+    delete_existing_object(cross_section_name)
 
     # Create a 2D curve.
     curve_data = bpy.data.curves.new(
-        name=CROSS_SECTION_NAME,
+        name=cross_section_name,
         type="CURVE",
     )
 
@@ -308,7 +312,7 @@ try:
         spline.use_cyclic_u = is_closed
 
     section_obj = bpy.data.objects.new(
-        CROSS_SECTION_NAME,
+        cross_section_name,
         curve_data,
     )
 
@@ -320,7 +324,7 @@ try:
     bpy.context.view_layer.objects.active = section_obj
 
     print(
-        f"Created '{CROSS_SECTION_NAME}' at "
+        f"Created '{cross_section_name}' at "
         f"Z = {slice_z:.6f} Blender units."
     )
 
