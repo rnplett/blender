@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local Blender sign projects and generated CNC/SVG outputs
+sign-designs/
